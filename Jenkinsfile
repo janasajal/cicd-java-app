@@ -1,10 +1,14 @@
 pipeline {
     agent any
 
+    tools {
+        maven 'maven'
+    }
+
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-creds')
         SONAR_TOKEN = credentials('sonar-token')
-        DOCKERHUB_USERNAME = 'YOUR_DOCKERHUB_USERNAME'
+        DOCKERHUB_USERNAME = 'janasajal'
         IMAGE_NAME = "${DOCKERHUB_USERNAME}/cicd-java-app"
         IMAGE_TAG = "${BUILD_NUMBER}"
         SONAR_HOST_URL = 'http://192.168.49.2:30090'
@@ -17,7 +21,7 @@ pipeline {
             }
             post {
                 always {
-                    junit 'target/surefire-reports/*.xml'
+                    junit allowEmptyResults: true, testResults: 'target/surefire-reports/*.xml'
                 }
             }
         }
