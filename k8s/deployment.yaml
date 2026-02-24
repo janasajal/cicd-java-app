@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: cicd-java-app
-  namespace: dev
+  namespace: NAMESPACE_PLACEHOLDER
 spec:
   replicas: 1
   selector:
@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: cicd-java-app
-        image: YOUR_DOCKERHUB_USERNAME/cicd-java-app:latest
+        image: IMAGE_PLACEHOLDER
         ports:
         - containerPort: 8080
 ---
@@ -23,7 +23,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: cicd-java-app
-  namespace: dev
+  namespace: NAMESPACE_PLACEHOLDER
 spec:
   type: NodePort
   selector:
