@@ -1,8 +1,8 @@
-# CI/CD Pipeline Lab on AWS — Complete Guide
+# CI/CD Pipeline Lab on AWS — Complete Guide with ArgoCD GitOps
 
 **Author:** Sajal Jana  
 **Date:** February 2026  
-**Stack:** AWS EC2 · Minikube · Jenkins · SonarQube · Docker · Kubernetes
+**Stack:** AWS EC2 · Minikube · Jenkins · SonarQube · Docker · Kubernetes · ArgoCD
 
 ---
 
@@ -13,66 +13,94 @@
 3. [Infrastructure Setup](#infrastructure-setup)
 4. [Tool Installation](#tool-installation)
 5. [Kubernetes Deployments](#kubernetes-deployments)
-6. [Jenkins Configuration](#jenkins-configuration)
-7. [SonarQube Configuration](#sonarqube-configuration)
-8. [GitHub Repository Setup](#github-repository-setup)
-9. [Jenkinsfile Pipeline](#jenkinsfile-pipeline)
-10. [Application Source Code](#application-source-code)
-11. [Kubernetes Manifests](#kubernetes-manifests)
-12. [Troubleshooting Reference](#troubleshooting-reference)
-13. [Key Lessons Learned](#key-lessons-learned)
-14. [Pipeline Flow Summary](#pipeline-flow-summary)
+6. [ArgoCD Installation on Minikube](#argocd-installation-on-minikube)
+7. [Jenkins Configuration](#jenkins-configuration)
+8. [SonarQube Configuration](#sonarqube-configuration)
+9. [GitHub Repository Setup](#github-repository-setup)
+10. [GitOps Repository Structure](#gitops-repository-structure)
+11. [Application Source Code](#application-source-code)
+12. [Kubernetes Manifests](#kubernetes-manifests)
+13. [ArgoCD Application Manifests](#argocd-application-manifests)
+14. [Jenkinsfile Pipeline](#jenkinsfile-pipeline)
+15. [Troubleshooting Reference](#troubleshooting-reference)
+16. [Key Lessons Learned](#key-lessons-learned)
+17. [Pipeline Flow Summary](#pipeline-flow-summary)
 
 ---
 
 ## Overview
 
-This lab implements a complete end-to-end CI/CD pipeline on AWS using a single EC2 instance running Minikube (single-node Kubernetes). The pipeline automates the full software delivery lifecycle from code commit to production deployment, with a manual approval gate before production.
+This lab implements a complete end-to-end CI/CD pipeline on AWS using a single EC2 instance running Minikube (single-node Kubernetes). It follows the **GitOps** pattern:
+
+- **Jenkins** owns CI — build, test, scan, package, and update Git manifests
+- **ArgoCD** owns CD — it fully replaces `kubectl apply` and is triggered by Jenkins via the ArgoCD REST API after each approval gate
+
+There are **no direct `kubectl apply` commands** in the pipeline. All deployments are driven through ArgoCD.
 
 ### Pipeline Stages
 
 ```
-GitHub Push → Jenkins → Maven Build → SonarQube Scan → Docker Build/Push → DEV Deploy → Manual Approval → PROD Deploy
+GitHub Push
+    │
+    ▼
+Jenkins (CI)
+    ├── Stage 1: Maven Build & Test
+    ├── Stage 2: SonarQube Code Scan
+    ├── Stage 3: Docker Build & Push to DockerHub
+    ├── Stage 4: Update image tag in Git (kustomization.yaml)
+    ├── Stage 5: Trigger ArgoCD API → Sync DEV
+    ├── Stage 6: Manual Approval Gate
+    ├── Stage 7: Update PROD image tag in Git
+    └── Stage 8: Trigger ArgoCD API → Sync PROD
 ```
+
+### Why ArgoCD Instead of kubectl?
+
+| Concern | kubectl deploy (old) | ArgoCD deploy (new) |
+|---|---|---|
+| Deployment trigger | Jenkins runs kubectl | Jenkins calls ArgoCD API |
+| Source of truth | Jenkins pipeline | Git repository |
+| Drift detection | None | ArgoCD self-heals drift |
+| Rollback | Manual kubectl | One-click in ArgoCD UI |
+| Audit trail | Jenkins logs | Git commit history |
+| Visibility | None | ArgoCD UI with health status |
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  AWS EC2 (t3.xlarge)             │
-│                  Ubuntu 24.04                    │
-│                                                  │
-│  ┌─────────────────────────────────────────┐    │
-│  │         Minikube (Docker driver)         │    │
-│  │                                          │    │
-│  │  ┌──────────────┐  ┌─────────────────┐  │    │
-│  │  │   Jenkins    │  │   SonarQube     │  │    │
-│  │  │   Pod        │  │   Pod           │  │    │
-│  │  │   :8080      │  │   :9000         │  │    │
-│  │  └──────────────┘  └─────────────────┘  │    │
-│  │                                          │    │
-│  │  ┌──────────────┐  ┌─────────────────┐  │    │
-│  │  │  DEV NS      │  │   PROD NS       │  │    │
-│  │  │  cicd-app    │  │   cicd-app      │  │    │
-│  │  └──────────────┘  └─────────────────┘  │    │
-│  └─────────────────────────────────────────┘    │
-│                                                  │
-│  Docker Socket · kubectl binary · Port Forwards  │
-└─────────────────────────────────────────────────┘
-         │                        │
-    GitHub Repo              DockerHub
+┌────────────────────────────────────────────────────────────────┐
+│                     AWS EC2 (t3.xlarge)                         │
+│                     Ubuntu 24.04                                │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │                Minikube (Docker driver)                  │    │
+│  │                                                          │    │
+│  │  ┌────────────┐  ┌─────────────┐  ┌────────────────┐   │    │
+│  │  │  Jenkins   │  │  SonarQube  │  │    ArgoCD      │   │    │
+│  │  │  :8080     │  │  :9000      │  │    :8085       │   │    │
+│  │  └────────────┘  └─────────────┘  └────────────────┘   │    │
+│  │        │                                  │              │    │
+│  │        │  1. Calls ArgoCD REST API        │              │    │
+│  │        │─────────────────────────────────>│              │    │
+│  │        │                                  │              │    │
+│  │        │              2. ArgoCD syncs K8s │              │    │
+│  │        │                        ┌─────────┘              │    │
+│  │        │                        ▼                        │    │
+│  │        │         ┌──────────────────────────┐            │    │
+│  │        │         │  DEV NS   │   PROD NS    │            │    │
+│  │        │         │  cicd-app │   cicd-app   │            │    │
+│  │        │         └──────────────────────────┘            │    │
+│  └────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│  Docker Socket · Port Forwards (8080, 9000, 8085)               │
+└────────────────────────────────────────────────────────────────┘
+         │                    │                   │
+    GitHub Repo           DockerHub          ArgoCD watches
+    (app + k8s            (images)           GitHub for
+     manifests)                              manifest changes
 ```
-
-### Key Design Decisions
-
-- **Minikube with Docker driver** — runs K8s inside Docker on EC2, no separate VM needed
-- **Docker socket mount** — Jenkins pod uses EC2's Docker daemon directly to build images
-- **kubectl binary mount** — Jenkins pod uses EC2's kubectl to deploy to Minikube
-- **PersistentVolumes with hostPath** — Jenkins and SonarQube data survives pod restarts
-- **ServiceAccount with cluster-admin** — Jenkins can create namespaces and deploy workloads
-- **Port forwarding** — exposes Jenkins (:8080) and SonarQube (:9000) on EC2's public IP
 
 ---
 
@@ -85,16 +113,16 @@ GitHub Push → Jenkins → Maven Build → SonarQube Scan → Docker Build/Push
 | Instance Type | t3.xlarge (4 vCPU, 16GB RAM) |
 | AMI | Ubuntu 24.04 LTS |
 | Storage | 50GB gp3 |
-| Region | ap-south-1 (Mumbai) |
 
 ### Security Group Rules
 
-| Port | Protocol | Source | Purpose |
-|---|---|---|---|
-| 22 | TCP | Your IP | SSH access |
-| 8080 | TCP | 0.0.0.0/0 | Jenkins UI |
-| 9000 | TCP | 0.0.0.0/0 | SonarQube UI |
-| 30000-32767 | TCP | 0.0.0.0/0 | Kubernetes NodePort |
+| Port | Source | Purpose |
+|---|---|---|
+| 22 | Your IP | SSH |
+| 8080 | 0.0.0.0/0 | Jenkins UI |
+| 9000 | 0.0.0.0/0 | SonarQube UI |
+| 8085 | 0.0.0.0/0 | ArgoCD UI |
+| 30000-32767 | 0.0.0.0/0 | Kubernetes NodePort |
 
 ---
 
@@ -121,7 +149,8 @@ newgrp docker
 ### kubectl
 
 ```bash
-curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+curl -LO "https://dl.k8s.io/release/$(curl -L -s \
+  https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
 sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 ```
 
@@ -131,7 +160,6 @@ sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
 sudo install minikube-linux-amd64 /usr/local/bin/minikube
 
-# Start with resource limits appropriate for t3.xlarge
 minikube start --driver=docker --cpus=2 --memory=7000 --disk-size=30g
 ```
 
@@ -139,12 +167,15 @@ minikube start --driver=docker --cpus=2 --memory=7000 --disk-size=30g
 
 ## Kubernetes Deployments
 
-### Namespace & RBAC
+### Namespaces & RBAC
 
 ```bash
 kubectl create namespace jenkins
+kubectl create namespace argocd
+kubectl create namespace dev
+kubectl create namespace prod
 
-# ServiceAccount so Jenkins can deploy to K8s
+# ServiceAccount for Jenkins pod
 kubectl create serviceaccount jenkins-sa -n jenkins
 kubectl create clusterrolebinding jenkins-sa-binding \
   --clusterrole=cluster-admin \
@@ -154,7 +185,6 @@ kubectl create clusterrolebinding jenkins-sa-binding \
 ### PersistentVolumes
 
 ```yaml
-# jenkins-pv.yaml
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -206,6 +236,8 @@ spec:
 
 ### Jenkins Deployment
 
+> **Note:** Jenkins no longer needs a mounted `kubectl` binary because it no longer runs `kubectl apply`. It only needs Docker (to build images) and `curl` (to call the ArgoCD API).
+
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -239,8 +271,6 @@ spec:
           mountPath: /var/run/docker.sock
         - name: docker-bin
           mountPath: /usr/bin/docker
-        - name: kubectl-bin
-          mountPath: /usr/bin/kubectl
         resources:
           requests:
             memory: "512Mi"
@@ -258,9 +288,6 @@ spec:
       - name: docker-bin
         hostPath:
           path: /usr/bin/docker
-      - name: kubectl-bin
-        hostPath:
-          path: /usr/local/bin/kubectl
 ---
 apiVersion: v1
 kind: Service
@@ -338,30 +365,128 @@ spec:
     nodePort: 30090
 ```
 
-### Port Forwarding (Access from Public IP)
+### Port Forwarding
 
 ```bash
-# Start background port forwards
+# Start all port forwards in background
 nohup kubectl port-forward svc/jenkins 8080:8080 -n jenkins --address 0.0.0.0 \
   > /tmp/jenkins-pf.log 2>&1 &
 
 nohup kubectl port-forward svc/sonarqube 9000:9000 -n jenkins --address 0.0.0.0 \
   > /tmp/sonar-pf.log 2>&1 &
 
-# Stop port forwards
+nohup kubectl port-forward svc/argocd-server 8085:443 -n argocd --address 0.0.0.0 \
+  > /tmp/argocd-pf.log 2>&1 &
+
+# Stop all
 pkill -f port-forward
 ```
 
-### Fix kubectl Permissions Inside Jenkins Pod
+---
+
+## ArgoCD Installation on Minikube
+
+### Step 1 — Install ArgoCD
 
 ```bash
-# Copy kubectl into the running pod (avoids hostPath permission issues)
-kubectl cp /usr/local/bin/kubectl \
-  jenkins/$(kubectl get pods -n jenkins | grep jenkins | grep -v sonar | awk '{print $1}'):/usr/local/bin/kubectl
+# Install ArgoCD into its own namespace
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
-kubectl exec -n jenkins \
-  $(kubectl get pods -n jenkins | grep jenkins | grep -v sonar | awk '{print $1}') \
-  -- chmod 755 /usr/local/bin/kubectl
+# Wait for all pods to be ready (may take 2-3 minutes)
+kubectl wait --for=condition=Ready pods --all -n argocd --timeout=300s
+
+# Verify
+kubectl get pods -n argocd
+```
+
+Expected pods running:
+
+```
+argocd-application-controller-0       1/1   Running
+argocd-applicationset-controller-xxx  1/1   Running
+argocd-dex-server-xxx                 1/1   Running
+argocd-notifications-controller-xxx   1/1   Running
+argocd-redis-xxx                      1/1   Running
+argocd-repo-server-xxx                1/1   Running
+argocd-server-xxx                     1/1   Running
+```
+
+### Step 2 — Get Admin Password
+
+```bash
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d && echo
+```
+
+### Step 3 — Access ArgoCD UI
+
+```bash
+# Port forward
+nohup kubectl port-forward svc/argocd-server 8085:443 -n argocd --address 0.0.0.0 \
+  > /tmp/argocd-pf.log 2>&1 &
+```
+
+Open `https://<EC2-IP>:8085` — Login: `admin` / `<password from step 2>`
+
+### Step 4 — Generate ArgoCD API Token for Jenkins
+
+Jenkins will call ArgoCD's REST API to trigger syncs. It needs an API token.
+
+In ArgoCD UI:
+1. Go to **Settings → Accounts**
+2. Click **New Account** → Name: `jenkins`, enable **apiKey** capability → Save
+3. Go to **Settings → Accounts → jenkins**
+4. Click **Generate New Token** → copy the token
+
+Or via CLI:
+
+```bash
+# Install ArgoCD CLI on EC2
+curl -sSL -o /usr/local/bin/argocd \
+  https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+chmod +x /usr/local/bin/argocd
+
+# Login
+argocd login localhost:8085 \
+  --username admin \
+  --password <your-admin-password> \
+  --insecure
+
+# Create jenkins account and generate token
+argocd account generate-token --account jenkins
+```
+
+Copy the generated token — add it to Jenkins credentials as `argocd-api-token` (Secret text).
+
+### Step 5 — Grant Jenkins Account Permissions
+
+```bash
+# Give jenkins account permission to sync applications
+kubectl patch configmap argocd-cm -n argocd --patch '
+data:
+  accounts.jenkins: apiKey
+'
+
+kubectl patch configmap argocd-rbac-cm -n argocd --patch '
+data:
+  policy.csv: |
+    p, role:jenkins, applications, sync, */*, allow
+    p, role:jenkins, applications, get, */*, allow
+    g, jenkins, role:jenkins
+  policy.default: role:readonly
+'
+```
+
+### Step 6 — Apply ArgoCD Applications
+
+```bash
+# Apply both Application manifests (see ArgoCD Application Manifests section)
+kubectl apply -f argocd/app-dev.yaml
+kubectl apply -f argocd/app-prod.yaml
+
+# Verify
+kubectl get applications -n argocd
 ```
 
 ---
@@ -370,21 +495,23 @@ kubectl exec -n jenkins \
 
 ### Plugins to Install
 
-Navigate to **Manage Jenkins → Plugins → Available plugins** and install:
+**Manage Jenkins → Plugins → Available plugins:**
 
 - `SonarQube Scanner`
 - `Docker Pipeline`
-- `Kubernetes CLI`
 - `Pipeline Stage View`
+- `HTTP Request` ← needed to call ArgoCD REST API
 
 ### Credentials
 
-Navigate to **Manage Jenkins → Credentials → System → Global credentials**:
+**Manage Jenkins → Credentials → System → Global credentials:**
 
 | ID | Kind | Value |
 |---|---|---|
 | `dockerhub-creds` | Username with password | DockerHub username + PAT token |
 | `sonar-token` | Secret text | SonarQube generated token |
+| `github-token` | Username with password | GitHub username + Personal Access Token |
+| `argocd-api-token` | Secret text | ArgoCD API token for `jenkins` account |
 
 ### Tools Configuration
 
@@ -398,17 +525,17 @@ Navigate to **Manage Jenkins → Credentials → System → Global credentials**
 
 - Name: `sonarqube`
 - URL: `http://192.168.49.2:30090`
-- Token: select `sonar-token` credential
+- Token: select `sonar-token`
 
 ---
 
 ## SonarQube Configuration
 
-1. Access at `http://<EC2-IP>:9000`
+1. Access `http://<EC2-IP>:9000`
 2. Login: `admin` / `admin` → change password on first login
-3. Navigate to **My Account → Security → Generate Token**
+3. **My Account → Security → Generate Token**
 4. Name: `jenkins-token`, Type: `Global Analysis Token`
-5. Copy the generated token → add to Jenkins credentials as `sonar-token`
+5. Copy token → add to Jenkins credentials as `sonar-token`
 
 ---
 
@@ -417,23 +544,29 @@ Navigate to **Manage Jenkins → Credentials → System → Global credentials**
 ### SSH Key Authentication
 
 ```bash
-# Generate key on EC2
+# Generate SSH key on EC2
 ssh-keygen -t ed25519 -C "jenkins-cicd" -f ~/.ssh/id_ed25519 -N ""
 
-# Print public key — copy this to GitHub
+# Print public key — copy to GitHub → Settings → SSH Keys
 cat ~/.ssh/id_ed25519.pub
 
-# Test connection
+# Test
 ssh -T git@github.com
 
-# Set repo remote to SSH
+# Set remote to SSH
 cd ~/cicd-java-app
 git remote set-url origin git@github.com:janasajal/cicd-java-app.git
 ```
 
-Add the public key to **GitHub → Settings → SSH and GPG keys → New SSH key**.
+### GitHub Personal Access Token
 
-### Repository Structure
+Jenkins needs a PAT to push image tag updates back to the repository. Create one at **GitHub → Settings → Developer Settings → Personal Access Tokens → Tokens (classic)** with `repo` scope. Add to Jenkins credentials as `github-token`.
+
+---
+
+## GitOps Repository Structure
+
+In the GitOps model the repository holds both application source code and Kubernetes manifests. Jenkins is responsible for committing the new image tag into the manifests. ArgoCD watches the repository and syncs the cluster when it detects a change.
 
 ```
 cicd-java-app/
@@ -441,11 +574,39 @@ cicd-java-app/
 │   ├── main/java/com/example/App.java
 │   └── test/java/com/example/AppTest.java
 ├── k8s/
-│   └── deployment.yaml
+│   ├── base/
+│   │   ├── deployment.yaml          # Base deployment (no image tag)
+│   │   ├── service.yaml             # Base service
+│   │   └── kustomization.yaml       # Lists base resources
+│   └── overlays/
+│       ├── dev/
+│       │   └── kustomization.yaml   # DEV image tag ← Jenkins updates this
+│       └── prod/
+│           └── kustomization.yaml   # PROD image tag ← Jenkins updates this
+├── argocd/
+│   ├── app-dev.yaml                 # ArgoCD Application for DEV
+│   └── app-prod.yaml                # ArgoCD Application for PROD
 ├── Dockerfile
 ├── Jenkinsfile
 └── pom.xml
 ```
+
+### What Jenkins Writes to Git
+
+After building and pushing Docker image tag `BUILD_NUMBER`, Jenkins runs:
+
+```bash
+# Update DEV overlay
+sed -i "s|newTag:.*|newTag: \"${BUILD_NUMBER}\"|g" \
+  k8s/overlays/dev/kustomization.yaml
+
+git commit -am "CI: update DEV image to ${BUILD_NUMBER} [skip ci]"
+git push origin main
+```
+
+Then calls ArgoCD API to sync immediately without waiting for the poll interval.
+
+> **`[skip ci]`** in the commit message prevents GitHub from triggering another Jenkins build, avoiding an infinite loop.
 
 ---
 
@@ -532,20 +693,19 @@ EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
 ```
 
-> **Note:** `openjdk:11-jre-slim` was removed from DockerHub. Use `eclipse-temurin:11-jre-jammy` instead.
+> **Note:** `openjdk:11-jre-slim` was removed from DockerHub. Use `eclipse-temurin:11-jre-jammy`.
 
 ---
 
 ## Kubernetes Manifests
 
-### k8s/deployment.yaml
+### k8s/base/deployment.yaml
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: cicd-java-app
-  namespace: NAMESPACE_PLACEHOLDER
 spec:
   replicas: 1
   selector:
@@ -558,15 +718,18 @@ spec:
     spec:
       containers:
       - name: cicd-java-app
-        image: IMAGE_PLACEHOLDER
+        image: janasajal/cicd-java-app   # Kustomize overlays set the tag
         ports:
         - containerPort: 8080
----
+```
+
+### k8s/base/service.yaml
+
+```yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: cicd-java-app
-  namespace: NAMESPACE_PLACEHOLDER
 spec:
   type: NodePort
   selector:
@@ -574,9 +737,124 @@ spec:
   ports:
   - port: 8080
     targetPort: 8080
+    # No fixed nodePort — Kubernetes auto-assigns to avoid conflicts
 ```
 
-> **Note:** Do not set a fixed `nodePort` value — let Kubernetes auto-assign to avoid conflicts between DEV and PROD namespaces.
+### k8s/base/kustomization.yaml
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+```
+
+### k8s/overlays/dev/kustomization.yaml
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: dev
+resources:
+  - ../../base
+images:
+  - name: janasajal/cicd-java-app
+    newTag: "latest"    # Jenkins updates this value on every build
+```
+
+### k8s/overlays/prod/kustomization.yaml
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: prod
+resources:
+  - ../../base
+images:
+  - name: janasajal/cicd-java-app
+    newTag: "latest"    # Jenkins updates this value after manual approval
+```
+
+---
+
+## ArgoCD Application Manifests
+
+### argocd/app-dev.yaml
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cicd-java-app-dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/janasajal/cicd-java-app.git
+    targetRevision: main
+    path: k8s/overlays/dev          # Points to DEV kustomize overlay
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dev
+  syncPolicy:
+    automated:
+      prune: true       # Delete K8s resources removed from Git
+      selfHeal: true    # Revert any manual changes back to Git state
+    syncOptions:
+      - CreateNamespace=true
+```
+
+### argocd/app-prod.yaml
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cicd-java-app-prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/janasajal/cicd-java-app.git
+    targetRevision: main
+    path: k8s/overlays/prod         # Points to PROD kustomize overlay
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+### How ArgoCD Sync Is Triggered by Jenkins
+
+Jenkins does **not** wait for ArgoCD's polling interval (default 3 minutes). Instead it calls the ArgoCD REST API directly to trigger an immediate sync:
+
+```bash
+# Trigger sync via ArgoCD REST API
+curl -k -X POST \
+  -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+  -H "Content-Type: application/json" \
+  https://localhost:8085/api/v1/applications/cicd-java-app-dev/sync \
+  -d '{}'
+
+# Poll sync status until Synced + Healthy
+curl -k \
+  -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+  https://localhost:8085/api/v1/applications/cicd-java-app-dev \
+  | python3 -c "import sys,json; \
+      app=json.load(sys.stdin); \
+      print(app['status']['sync']['status'], \
+            app['status']['health']['status'])"
+```
 
 ---
 
@@ -591,12 +869,17 @@ pipeline {
     environment {
         DOCKERHUB_CREDENTIALS = credentials('dockerhub-creds')
         SONAR_TOKEN           = credentials('sonar-token')
-        DOCKERHUB_USERNAME    = 'janasajal'
+        GITHUB_CREDENTIALS    = credentials('github-token')
+        ARGOCD_TOKEN          = credentials('argocd-api-token')
         IMAGE_NAME            = 'janasajal/cicd-java-app'
         IMAGE_TAG             = "${BUILD_NUMBER}"
         SONAR_HOST_URL        = 'http://192.168.49.2:30090'
+        ARGOCD_SERVER         = 'https://localhost:8085'
+        GIT_REPO_HTTPS        = 'https://github.com/janasajal/cicd-java-app.git'
     }
+
     stages {
+
         stage('Maven Build & Test') {
             steps {
                 sh 'mvn clean package'
@@ -608,6 +891,7 @@ pipeline {
                 }
             }
         }
+
         stage('SonarQube Code Scan') {
             steps {
                 sh """
@@ -618,10 +902,12 @@ pipeline {
                 """
             }
         }
+
         stage('Docker Build & Push') {
             steps {
                 sh """
-                    echo ${DOCKERHUB_CREDENTIALS_PSW} | docker login -u ${DOCKERHUB_CREDENTIALS_USR} --password-stdin
+                    echo ${DOCKERHUB_CREDENTIALS_PSW} | \
+                      docker login -u ${DOCKERHUB_CREDENTIALS_USR} --password-stdin
                     docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
                     docker push ${IMAGE_NAME}:${IMAGE_TAG}
                     docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
@@ -629,35 +915,138 @@ pipeline {
                 """
             }
         }
-        stage('Deploy to DEV') {
+
+        stage('Update DEV Image Tag in Git') {
             steps {
                 sh """
-                    kubectl create namespace dev --dry-run=client -o yaml | kubectl apply -f -
-                    sed 's|IMAGE_PLACEHOLDER|${IMAGE_NAME}:${IMAGE_TAG}|g' k8s/deployment.yaml | \
-                    sed 's|NAMESPACE_PLACEHOLDER|dev|g' | kubectl apply -f -
+                    git config user.email "jenkins@cicd.local"
+                    git config user.name "Jenkins CI"
+
+                    sed -i 's|newTag:.*|newTag: "${IMAGE_TAG}"|g' \
+                      k8s/overlays/dev/kustomization.yaml
+
+                    git add k8s/overlays/dev/kustomization.yaml
+                    git commit -m "CI: update DEV image tag to ${IMAGE_TAG} [skip ci]"
+
+                    git push https://${GITHUB_CREDENTIALS_USR}:${GITHUB_CREDENTIALS_PSW}@github.com/janasajal/cicd-java-app.git main
                 """
             }
         }
-        stage('Manual Approval') {
+
+        stage('ArgoCD Sync DEV') {
             steps {
-                timeout(time: 5, unit: 'MINUTES') {
-                    input message: 'Deploy to PROD?', ok: 'Approve'
+                script {
+                    // Trigger sync via ArgoCD REST API
+                    sh """
+                        echo "Triggering ArgoCD sync for DEV..."
+
+                        curl -k -s -X POST \
+                          -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          ${ARGOCD_SERVER}/api/v1/applications/cicd-java-app-dev/sync \
+                          -d '{}'
+                    """
+
+                    // Poll until Synced + Healthy (max 3 minutes)
+                    timeout(time: 3, unit: 'MINUTES') {
+                        waitUntil {
+                            def result = sh(
+                                script: """
+                                    curl -k -s \
+                                      -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+                                      ${ARGOCD_SERVER}/api/v1/applications/cicd-java-app-dev \
+                                    | python3 -c "
+import sys, json
+app = json.load(sys.stdin)
+sync   = app['status']['sync']['status']
+health = app['status']['health']['status']
+print(sync, health)
+sys.exit(0 if sync == 'Synced' and health == 'Healthy' else 1)
+"
+                                """,
+                                returnStatus: true
+                            )
+                            return result == 0
+                        }
+                    }
+                    echo "DEV deployment Synced and Healthy!"
                 }
             }
         }
-        stage('Deploy to PROD') {
+
+        stage('Manual Approval') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    input message: 'DEV looks good. Approve deployment to PROD?',
+                          ok: 'Approve'
+                }
+            }
+        }
+
+        stage('Update PROD Image Tag in Git') {
             steps {
                 sh """
-                    kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
-                    sed 's|IMAGE_PLACEHOLDER|${IMAGE_NAME}:${IMAGE_TAG}|g' k8s/deployment.yaml | \
-                    sed 's|NAMESPACE_PLACEHOLDER|prod|g' | kubectl apply -f -
+                    git config user.email "jenkins@cicd.local"
+                    git config user.name "Jenkins CI"
+
+                    sed -i 's|newTag:.*|newTag: "${IMAGE_TAG}"|g' \
+                      k8s/overlays/prod/kustomization.yaml
+
+                    git add k8s/overlays/prod/kustomization.yaml
+                    git commit -m "CI: update PROD image tag to ${IMAGE_TAG} [skip ci]"
+
+                    git push https://${GITHUB_CREDENTIALS_USR}:${GITHUB_CREDENTIALS_PSW}@github.com/janasajal/cicd-java-app.git main
                 """
             }
         }
+
+        stage('ArgoCD Sync PROD') {
+            steps {
+                script {
+                    sh """
+                        echo "Triggering ArgoCD sync for PROD..."
+
+                        curl -k -s -X POST \
+                          -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+                          -H "Content-Type: application/json" \
+                          ${ARGOCD_SERVER}/api/v1/applications/cicd-java-app-prod/sync \
+                          -d '{}'
+                    """
+
+                    timeout(time: 3, unit: 'MINUTES') {
+                        waitUntil {
+                            def result = sh(
+                                script: """
+                                    curl -k -s \
+                                      -H "Authorization: Bearer ${ARGOCD_TOKEN}" \
+                                      ${ARGOCD_SERVER}/api/v1/applications/cicd-java-app-prod \
+                                    | python3 -c "
+import sys, json
+app = json.load(sys.stdin)
+sync   = app['status']['sync']['status']
+health = app['status']['health']['status']
+print(sync, health)
+sys.exit(0 if sync == 'Synced' and health == 'Healthy' else 1)
+"
+                                """,
+                                returnStatus: true
+                            )
+                            return result == 0
+                        }
+                    }
+                    echo "PROD deployment Synced and Healthy!"
+                }
+            }
+        }
     }
+
     post {
-        success { echo 'Pipeline succeeded!' }
-        failure { echo 'Pipeline failed!' }
+        success {
+            echo 'Pipeline complete! DEV and PROD deployed via ArgoCD.'
+        }
+        failure {
+            echo 'Pipeline failed! Check stage logs above.'
+        }
     }
 }
 ```
@@ -666,139 +1055,153 @@ pipeline {
 
 ## Troubleshooting Reference
 
-### Common Issues & Fixes
-
 | Error | Cause | Fix |
 |---|---|---|
-| `mvn: not found` | Maven not in PATH | Add `tools { maven 'maven' }` block to Jenkinsfile |
+| `mvn: not found` | Maven not in PATH | Add `tools { maven 'maven' }` to Jenkinsfile |
 | `docker: not found` | Docker socket not mounted | Mount `/var/run/docker.sock` and `/usr/bin/docker` as hostPath volumes |
-| `kubectl: not found` | kubectl not in Jenkins container | Copy binary into pod: `kubectl cp /usr/local/bin/kubectl jenkins/<pod>:/usr/local/bin/kubectl` |
-| `kubectl: Permission denied` | hostPath mount overrides permissions | Use `kubectl cp` to copy binary directly into pod, then `chmod 755` |
-| `manifest unknown` for `openjdk:11-jre-slim` | Image removed from DockerHub | Use `eclipse-temurin:11-jre-jammy` instead |
-| `nodePort already allocated` | DEV and PROD share same port | Remove fixed `nodePort` from Service, let K8s auto-assign |
-| `fatal: not in a git directory` | Corrupt workspace | Delete workspace: `rm -rf /var/jenkins_home/workspace/cicd-java-pipeline*` |
+| `docker: Permission denied` | hostPath overrides permissions | `kubectl cp /usr/bin/docker jenkins/<pod>:/usr/bin/docker` + `chmod 755` |
+| `manifest unknown` openjdk:11-jre-slim | Image removed from DockerHub | Use `eclipse-temurin:11-jre-jammy` |
+| `nodePort already allocated` | Fixed port conflict between namespaces | Remove fixed `nodePort`, let K8s auto-assign |
+| `fatal: not in a git directory` | Corrupt Jenkins workspace | `rm -rf /var/jenkins_home/workspace/cicd-java-pipeline*` |
 | Jenkins pod `Pending` — Insufficient CPU | Resource requests too high | Lower `requests.cpu` to `250m` |
-| Port forward dies after pod restart | Process killed | Re-run `nohup kubectl port-forward ...` commands |
-| Data lost after pod restart | Using `emptyDir` storage | Use PersistentVolumeClaims backed by hostPath PVs |
+| ArgoCD API returns `401 Unauthorized` | Invalid or expired token | Regenerate token: `argocd account generate-token --account jenkins` |
+| ArgoCD app stuck `OutOfSync` | Git path wrong or kustomization invalid | Verify `path` in app manifest matches repo, run `kubectl kustomize k8s/overlays/dev` locally |
+| ArgoCD app `Degraded` | Pod failing health check | `kubectl logs -n dev <pod-name>` |
+| `[skip ci]` not working | Git provider doesn't support it | Add a webhook filter in Jenkins to ignore commits by `Jenkins CI` |
+| Port forward dies | Process killed on pod restart | Re-run all `nohup kubectl port-forward` commands |
+| Data lost after pod restart | `emptyDir` storage used | Use PersistentVolumeClaims backed by hostPath PVs |
 
 ### Useful Commands
 
 ```bash
-# Check pod status
-kubectl get pods -n jenkins
+# ArgoCD application status
+kubectl get applications -n argocd
+argocd app list
+argocd app get cicd-java-app-dev
+argocd app get cicd-java-app-prod
 
-# Check pod logs
-kubectl logs -n jenkins <pod-name>
+# Force sync via CLI
+argocd app sync cicd-java-app-dev --insecure --server localhost:8085
+argocd app sync cicd-java-app-prod --insecure --server localhost:8085
 
-# Describe pod (see events/errors)
-kubectl describe pod -n jenkins <pod-name>
+# Wait for sync to complete
+argocd app wait cicd-java-app-prod --sync --health --timeout 120 \
+  --insecure --server localhost:8085
 
-# Check PVC binding
-kubectl get pvc -n jenkins
+# Diff what ArgoCD will change
+argocd app diff cicd-java-app-dev
 
-# Restart a deployment
-kubectl rollout restart deployment/jenkins -n jenkins
+# Rollback to previous version
+argocd app rollback cicd-java-app-prod
 
-# Get Jenkins initial admin password
-kubectl exec -n jenkins <pod-name> -- cat /var/jenkins_home/secrets/initialAdminPassword
+# Validate kustomize overlays locally
+kubectl kustomize k8s/overlays/dev
+kubectl kustomize k8s/overlays/prod
 
-# Verify docker works inside Jenkins pod
-kubectl exec -n jenkins <pod-name> -- docker ps
-
-# Verify kubectl works inside Jenkins pod
-kubectl exec -n jenkins <pod-name> -- kubectl version --client
-
-# Check DEV/PROD deployments
+# Check deployed app
 kubectl get all -n dev
 kubectl get all -n prod
+
+# Get ArgoCD admin password
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d
+
+# Restart Jenkins pod
+kubectl rollout restart deployment/jenkins -n jenkins
 ```
 
 ---
 
 ## Key Lessons Learned
 
-### 1. Docker-in-Docker via Socket Mount
-Running Docker commands inside a Kubernetes pod requires mounting the host's Docker socket (`/var/run/docker.sock`). This gives the pod access to the EC2's Docker daemon rather than needing a separate Docker installation.
+### 1. ArgoCD API Trigger vs Git Polling
+ArgoCD polls Git every 3 minutes by default. For a CI/CD pipeline you don't want to wait — Jenkins triggers an immediate sync via the REST API (`POST /api/v1/applications/<name>/sync`) right after committing the image tag. This combines the speed of push-based delivery with the auditability of GitOps.
 
-### 2. PersistentVolumes Are Essential
-Using `emptyDir` for Jenkins and SonarQube means all data (jobs, plugins, credentials, config) is lost whenever the pod restarts. Always use PVCs backed by `hostPath` PVs in this setup.
+### 2. Jenkins Writes to Git, Not to Kubernetes
+The key GitOps shift is that Jenkins no longer runs `kubectl apply`. Instead it commits a one-line change (`newTag`) to the Kustomize overlay and lets ArgoCD do the actual deployment. This means the cluster state is always version-controlled and auditable.
 
-### 3. hostPath Binary Mounts vs kubectl cp
-Mounting binaries like `docker` and `kubectl` via `hostPath` can cause permission issues because the mount overrides the container's filesystem permissions. Copying the binary directly into the pod using `kubectl cp` followed by `chmod 755` is more reliable.
+### 3. Kustomize Overlays for Environment Separation
+Using `base` + `overlays/dev` + `overlays/prod` avoids duplicating YAML across environments. The only difference between DEV and PROD is the `newTag` value and the `namespace` — everything else is inherited from `base`.
 
-### 4. Namespace Isolation for Environments
-Using separate Kubernetes namespaces (`dev` and `prod`) provides environment isolation. Always use `--dry-run=client -o yaml | kubectl apply -f -` for idempotent namespace creation.
+### 4. `[skip ci]` Prevents Infinite Loops
+When Jenkins pushes an image tag update back to GitHub, GitHub fires another webhook. Without `[skip ci]` in the commit message, this would trigger another Jenkins build infinitely.
 
-### 5. NodePort Conflicts
-When deploying the same Service manifest to multiple namespaces, avoid hardcoding `nodePort` values. Let Kubernetes auto-assign ports to prevent conflicts.
+### 5. `selfHeal: true` Enforces Git as Single Source of Truth
+With `selfHeal` enabled, if anyone manually edits a Kubernetes resource (`kubectl edit deployment`), ArgoCD reverts it within minutes to match Git. This strictly enforces the GitOps principle.
 
-### 6. Base Image Availability
-`openjdk:11-jre-slim` was deprecated and removed from DockerHub. Always use actively maintained base images like `eclipse-temurin` from Adoptium.
+### 6. `prune: true` Keeps the Cluster Clean
+When a manifest is deleted from Git, ArgoCD deletes the corresponding Kubernetes resource. Without this, deleted manifests leave orphaned resources accumulating in the cluster over time.
 
-### 7. Resource Management on Small Clusters
-On a single-node Minikube cluster with limited RAM, setting low resource `requests` (e.g., `250m` CPU, `512Mi` memory) while keeping higher `limits` allows pods to schedule without starving each other.
+### 7. Separate ArgoCD Account for Jenkins
+Never use the `admin` account in Jenkins. Create a dedicated `jenkins` account in ArgoCD with only the permissions it needs (`applications, sync` and `applications, get`). This follows the principle of least privilege.
 
-### 8. Groovy String Interpolation Security
-Using `${VARIABLE}` inside a `sh` block with secret credentials leaks them in logs. Jenkins warns about this. For production, use `withCredentials` blocks or single-quoted strings where possible.
+### 8. ArgoCD Health Polling in Jenkinsfile
+After triggering a sync, Jenkins uses `waitUntil` to poll the ArgoCD API until the application reports both `Synced` and `Healthy`. This ensures the pipeline only proceeds (or marks success) once the deployment is genuinely running.
 
 ---
 
 ## Pipeline Flow Summary
 
 ```
-┌─────────────┐
-│  Developer  │
-│  git push   │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────────────────────────────────────────────┐
-│                    Jenkins Pipeline                  │
-│                                                     │
-│  Stage 1: Maven Build & Test                        │
-│  ├── mvn clean package                              │
-│  └── JUnit test report published                    │
-│                                                     │
-│  Stage 2: SonarQube Code Scan                       │
-│  ├── mvn sonar:sonar                                │
-│  └── Results at http://192.168.49.2:30090           │
-│                                                     │
-│  Stage 3: Docker Build & Push                       │
-│  ├── docker build -t janasajal/cicd-java-app:N .    │
-│  ├── docker push janasajal/cicd-java-app:N          │
-│  └── docker push janasajal/cicd-java-app:latest     │
-│                                                     │
-│  Stage 4: Deploy to DEV                             │
-│  ├── kubectl create namespace dev                   │
-│  └── kubectl apply (Deployment + Service)           │
-│                                                     │
-│  Stage 5: Manual Approval Gate ⏸                    │
-│  └── Human clicks "Approve" in Jenkins UI           │
-│                                                     │
-│  Stage 6: Deploy to PROD                            │
-│  ├── kubectl create namespace prod                  │
-│  └── kubectl apply (Deployment + Service)           │
-└─────────────────────────────────────────────────────┘
-       │                    │
-       ▼                    ▼
-┌──────────────┐    ┌──────────────┐
-│  DEV NS      │    │  PROD NS     │
-│  cicd-java   │    │  cicd-java   │
-│  -app pod    │    │  -app pod    │
-└──────────────┘    └──────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    COMPLETE GITOPS PIPELINE                       │
+│                                                                   │
+│  Stage 1 │ Maven Build & Test                                    │
+│          │ mvn clean package → JUnit results published           │
+│                                                                   │
+│  Stage 2 │ SonarQube Code Scan                                   │
+│          │ mvn sonar:sonar → results at :30090                   │
+│                                                                   │
+│  Stage 3 │ Docker Build & Push                                   │
+│          │ docker build → push janasajal/cicd-java-app:N         │
+│                                                                   │
+│  Stage 4 │ Update DEV Image Tag in Git                           │
+│          │ sed newTag → git commit "[skip ci]" → git push        │
+│                                                                   │
+│  Stage 5 │ ArgoCD Sync DEV                            [API]      │
+│          │ POST /api/v1/applications/cicd-java-app-dev/sync      │
+│          │ Poll until Synced + Healthy                           │
+│                                                                   │
+│  Stage 6 │ Manual Approval Gate                        [⏸]      │
+│          │ Human reviews DEV → clicks Approve                    │
+│                                                                   │
+│  Stage 7 │ Update PROD Image Tag in Git                          │
+│          │ sed newTag → git commit "[skip ci]" → git push        │
+│                                                                   │
+│  Stage 8 │ ArgoCD Sync PROD                           [API]      │
+│          │ POST /api/v1/applications/cicd-java-app-prod/sync     │
+│          │ Poll until Synced + Healthy                           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Tool Responsibilities
+
+```
+Jenkins (CI)                           ArgoCD (CD)
+──────────────────────────────         ──────────────────────────────
+✅ Compile source code                 ✅ Watch Git for manifest changes
+✅ Run unit tests                      ✅ Sync cluster state to Git
+✅ Static code analysis (Sonar)        ✅ Self-heal configuration drift
+✅ Build Docker image                  ✅ Prune deleted resources
+✅ Push to DockerHub                   ✅ Health check deployments
+✅ Commit new image tag to Git         ✅ Rollback on sync failure
+✅ Call ArgoCD API to trigger sync     ✅ Visual dashboard of app health
+✅ Gate production with approval       ✅ Full audit trail in ArgoCD UI
 ```
 
 ### Final Stage Results
 
-| Stage | Status | Notes |
+| Stage | Tool | Status |
 |---|---|---|
-| Maven Build & Test | ✅ SUCCESS | 1 test passed, JAR built |
-| SonarQube Code Scan | ✅ SUCCESS | Analysis uploaded, dashboard updated |
-| Docker Build & Push | ✅ SUCCESS | Image pushed to DockerHub |
-| Deploy to DEV | ✅ SUCCESS | Pod running in `dev` namespace |
-| Manual Approval | ✅ APPROVED | Human gate passed |
-| Deploy to PROD | ✅ SUCCESS | Pod running in `prod` namespace |
+| Maven Build & Test | Jenkins + Maven | ✅ |
+| SonarQube Code Scan | Jenkins + SonarQube | ✅ |
+| Docker Build & Push | Jenkins + Docker | ✅ |
+| Update DEV Tag in Git | Jenkins + Git | ✅ |
+| Deploy to DEV | ArgoCD (via API trigger) | ✅ |
+| Manual Approval | Jenkins input gate | ✅ |
+| Update PROD Tag in Git | Jenkins + Git | ✅ |
+| Deploy to PROD | ArgoCD (via API trigger) | ✅ |
 
 ---
 
-*Document prepared by Sajal Jana — CI/CD Pipeline Lab, February 2026*
+*Document prepared by Sajal Jana — CI/CD Pipeline Lab with ArgoCD GitOps, February 2026*
