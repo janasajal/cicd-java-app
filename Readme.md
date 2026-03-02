@@ -37,6 +37,9 @@ This lab implements a complete end-to-end CI/CD pipeline on AWS using a single E
 
 There are **no direct `kubectl apply` commands** in the pipeline. All deployments are driven through ArgoCD.
 
+<img width="1024" height="1536" alt="cicd2" src="https://github.com/user-attachments/assets/cad759be-0e53-4c12-9e1c-6daaf59ec6d8" />
+
+
 ### Pipeline Stages
 
 ```
